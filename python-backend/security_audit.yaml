@@ -1,0 +1,454 @@
+name: Pre-CI Security Audit
+
+on:
+  workflow_call:
+    inputs:
+      repo_type:
+        required: true
+        type: string
+        description: 'python, javascript, or both'
+      force_deploy:
+        required: false
+        type: boolean
+        default: false
+        description: 'Bypass age check failures and force deployment'
+    outputs:
+      has_failures:
+        value: ${{ jobs.gate.outputs.has_failures }}
+      failure_count:
+        value: ${{ jobs.gate.outputs.failure_count }}
+  push:
+    branches:
+      - security-audit-depx
+
+permissions:
+  contents: read
+
+# ===========================================================================
+# PARALLEL CHECK JOBS — each runs independently for speed
+# ===========================================================================
+
+jobs:
+  # ---------- 1/4: Supply-Chain Malware (depx) ----------
+  depx:
+    runs-on: ubuntu-latest
+    outputs:
+      depx_recent: ${{ steps.scan.outputs.depx_recent }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install depx
+        run: |
+          curl -sfL https://raw.githubusercontent.com/projectdiscovery/depx/main/scripts/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          depx version --disable-update-check
+      - uses: actions/cache@v6
+        with:
+          path: ~/.config/projectdiscovery
+          key: depx-${{ runner.os }}-${{ hashFiles('.github/workflows/security-audit.yml') }}
+          restore-keys: depx-${{ runner.os }}-
+      - name: depx scan
+        id: scan
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "# 🔗 1/4 — Supply-Chain: depx Malware Detection" >> depx_section.md
+          echo "" >> depx_section.md
+
+          python3 -c "
+          import json, re
+          packages = []
+          try:
+              with open('requirements.txt') as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line or line.startswith('#') or line.startswith('-r'): continue
+                      m = re.match(r'^([a-zA-Z0-9_.-]+)\s*[=<>~!]', line)
+                      if m: packages.append(f'PyPI:{m.group(1)}')
+          except FileNotFoundError: pass
+          try:
+              data = json.load(open('package.json'))
+              deps = {}
+              deps.update(data.get('dependencies',{}))
+              deps.update(data.get('devDependencies',{}))
+              for name in deps: packages.append(f'npm:{name}')
+          except: pass
+          if packages: print('\n'.join(packages))
+          " > /tmp/depx_packages.txt
+
+          DEPX_EXIT=0
+          if [ -s /tmp/depx_packages.txt ]; then
+            cat /tmp/depx_packages.txt | depx --json --disable-update-check > depx_report.json || DEPX_EXIT=$?
+          else
+            echo '{"data":{"results":[]}}' > depx_report.json
+          fi
+
+          python3 -c "
+          import json
+          from datetime import datetime, timezone, timedelta
+          data = json.load(open('depx_report.json'))
+          results = data.get('data',{}).get('results',[])
+          thirty = datetime.now(timezone.utc) - timedelta(days=30)
+          recent, old, clean_names = [], [], []
+          for r in results:
+              v = r.get('verdict','')
+              if v == 'clean':
+                  clean_names.append(r.get('package_name','N/A'))
+                  continue
+              if v != 'malicious': continue
+              mp = None
+              for a in r.get('advisories',[]):
+                  try:
+                      dt = datetime.fromisoformat(a.get('published_at','').replace('Z','+00:00'))
+                      if mp is None or dt > mp: mp = dt
+                  except: pass
+              if mp and mp >= thirty: recent.append(r)
+              else: old.append(r)
+
+          total = len(recent) + len(old) + len(clean_names)
+          with open('depx_section.md','a') as f:
+              f.write(f'| Metric                    | Count |\n')
+              f.write(f'| :------------------------ | :--- |\n')
+              f.write(f'| 🔴 Recent Malicious (≤30d) | {len(recent)} |\n')
+              f.write(f'| ⚪ Known Malicious (>30d)  | {len(old)} |\n')
+              f.write(f'| ✅ Clean Packages          | {len(clean_names)} |\n')
+              f.write(f'| 📦 Total Checked           | {total} |\n\n')
+              if recent:
+                  f.write('#### 🔴 Recent Threats — BLOCK (≤30 days)\n')
+                  f.write('| Package | Ecosystem | Advisory ID | Published | Summary |\n')
+                  f.write('| :--- | :--- | :--- | :--- | :--- |\n')
+                  for r in recent:
+                      p=r.get('package_name','N/A'); e=r.get('package_ecosystem','N/A')
+                      a=r.get('advisories',[]); aid=a[0].get('id','N/A')[:20] if a else 'N/A'
+                      pub=a[0].get('published_at','N/A')[:10] if a else 'N/A'
+                      s=(a[0].get('summary','N/A') or 'N/A')[:80] if a else 'N/A'
+                      f.write(f'| \x60{p}\x60 | {e} | {aid} | {pub} | {s} |\n')
+                  f.write('\n')
+              if old:
+                  f.write(f'<details><summary>⚪ Known Malicious — informational ({len(old)} packages, >30 days)</summary>\n\n')
+                  f.write('| Package | Ecosystem | Advisory ID | Published |\n')
+                  f.write('| :--- | :--- | :--- | :--- |\n')
+                  for r in old:
+                      p=r.get('package_name','N/A'); e=r.get('package_ecosystem','N/A')
+                      a=r.get('advisories',[]); aid=a[0].get('id','N/A')[:20] if a else 'N/A'
+                      pub=a[0].get('published_at','N/A')[:10] if a else 'N/A'
+                      f.write(f'| \x60{p}\x60 | {e} | {aid} | {pub} |\n')
+                  f.write('\n</details>\n\n')
+              if clean_names:
+                  f.write(f'<details><summary>✅ Clean Packages ({len(clean_names)} packages)</summary>\n\n')
+                  f.write('| Package |\n| :--- |\n')
+                  for n in sorted(set(clean_names)): f.write(f'| \x60{n}\x60 |\n')
+                  f.write('\n</details>\n\n')
+              if not results: f.write('✅ No dependency manifests found — depx skipped.\n')
+              elif not recent and not old: f.write('✅ No malicious packages detected.\n')
+              elif not recent: f.write('✅ No recent threats. All flagged are >30d known advisories.\n')
+
+          with open('/tmp/depx_count.txt','w') as f: f.write(str(len(recent)))
+          " 2>&1
+          echo "depx_recent=$(cat /tmp/depx_count.txt)" >> $GITHUB_OUTPUT
+
+          if [ "$DEPX_EXIT" -ne 0 ]; then
+            echo "⚠️ depx exited with code ${DEPX_EXIT} — results may be incomplete." >> depx_section.md
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: depx-section
+          path: depx_section.md
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          name: depx-report
+          path: depx_report.json
+          retention-days: 30
+
+  # ---------- 2/4: SAST (Semgrep) ----------
+  sast:
+    runs-on: ubuntu-latest
+    outputs:
+      sast_errors: ${{ steps.scan.outputs.sast_errors }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-semgrep-${{ hashFiles('.github/workflows/security-audit.yml') }}
+          restore-keys: pip-${{ runner.os }}-semgrep-
+      - name: Install semgrep
+        run: pip install --quiet semgrep
+      - name: Semgrep scan
+        id: scan
+        run: |
+          semgrep scan --config auto --optimizations=all --exclude ".github" --exclude "kubernetes" --json -o sast_report.json || true
+          python3 -c "
+          import json
+          data = json.load(open('sast_report.json'))
+          results = data.get('results',[])
+          cat_map = {'browser':'XSS','lang':'Injection','secrets':'Hardcoded','jsonwebtoken':'JWT','react':'React','javascript':'JS','typescript':'TS'}
+          errors   = [r for r in results if r.get('extra',{}).get('severity')=='ERROR']
+          warnings = [r for r in results if r.get('extra',{}).get('severity') in ('WARNING','INFO')]
+          with open('sast_section.md','w') as f:
+              f.write('# 🔍 2/4 — SAST: Semgrep Code Analysis\n\n')
+              f.write(f'| Severity | Count |\n| :--- | :--- |\n')
+              f.write(f'| 🔴 ERROR   | {len(errors)} |\n| 🟡 WARNING | {len(warnings)} |\n\n')
+              if not results: f.write('✅ No code issues found.\n')
+              else:
+                  if errors:
+                      f.write('#### 🔴 Errors — BLOCK\n')
+                      f.write('| Category | File | Line | Issue |\n| :--- | :--- | :--- | :--- |\n')
+                      for r in errors:
+                          rule=r.get('check_id',''); raw=rule.split('.')[1] if '.' in rule else 'general'
+                          cat=cat_map.get(raw,raw); fl=r.get('path',''); ln=r.get('start',{}).get('line','')
+                          msg=r.get('extra',{}).get('message','').split('\\\\n')[0]
+                          f.write(f'| {cat} | \x60{fl}:{ln}\x60 | {ln} | {msg} |\n')
+                      f.write('\n')
+                  if warnings:
+                      f.write(f'<details><summary>🟡 Warnings & Info ({len(warnings)} findings)</summary>\n\n')
+                      f.write('| Severity | Category | File | Line | Issue |\n| :--- | :--- | :--- | :--- | :--- |\n')
+                      for r in warnings:
+                          sev=r.get('extra',{}).get('severity','UNKNOWN'); icon='🟡' if sev=='WARNING' else '🔵'
+                          rule=r.get('check_id',''); raw=rule.split('.')[1] if '.' in rule else 'general'
+                          cat=cat_map.get(raw,raw); fl=r.get('path',''); ln=r.get('start',{}).get('line','')
+                          msg=r.get('extra',{}).get('message','').split('\\\\n')[0]
+                          f.write(f'| {icon} {sev} | {cat} | \x60{fl}:{ln}\x60 | {ln} | {msg} |\n')
+                      f.write('\n</details>\n\n')
+                  f.write(f'**{len(results)} total finding(s)** — full JSON archived.\n')
+          "
+          echo "sast_errors=$(python3 -c "import json;d=json.load(open('sast_report.json'));print(sum(1 for r in d.get('results',[]) if r.get('extra',{}).get('severity')=='ERROR'))")" >> $GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sast-section
+          path: sast_section.md
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sast-report
+          path: sast_report.json
+          retention-days: 30
+
+  # ---------- 3/4: SCA (Trivy) ----------
+  sca:
+    runs-on: ubuntu-latest
+    outputs:
+      sca_critical: ${{ steps.scan.outputs.sca_critical }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Trivy
+        run: |
+          TRIVY_VERSION=0.71.2
+          curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o /tmp/trivy.tar.gz
+          tar xzf /tmp/trivy.tar.gz -C /tmp
+          sudo install /tmp/trivy /usr/local/bin/trivy
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ runner.os }}-${{ hashFiles('.github/workflows/security-audit.yml') }}
+          restore-keys: trivy-db-${{ runner.os }}-
+      - name: Trivy scan
+        id: scan
+        run: |
+          trivy fs --pkg-types library --format json -o sca_report.json . 2>/dev/null || true
+          trivy fs --pkg-types library . > sca_report.txt 2>/dev/null || true
+          python3 -c "
+          import json
+          data = json.load(open('sca_report.json'))
+          results = data.get('Results',[])
+          all_v = []
+          for r in results: all_v.extend(r.get('Vulnerabilities',[]))
+          sev = {'CRITICAL':0,'HIGH':0,'MEDIUM':0,'LOW':0}
+          for v in all_v: sev[v.get('Severity','LOW')] = sev.get(v.get('Severity','LOW'),0) + 1
+          vc = len(all_v)
+          crit_high = [v for v in all_v if v.get('Severity') in ('CRITICAL','HIGH')]
+          med_low   = [v for v in all_v if v.get('Severity') in ('MEDIUM','LOW')]
+          all_v.sort(key=lambda v: {'CRITICAL':0,'HIGH':1,'MEDIUM':2,'LOW':3}.get(v.get('Severity',''),99))
+          with open('sca_section.md','w') as f:
+              f.write('# 📦 3/4 — SCA: Trivy Dependency Scan\n\n')
+              f.write(f'| Severity   | Count |\n| :--------- | :--- |\n')
+              f.write(f'| 🔴 CRITICAL | {sev[\"CRITICAL\"]} |\n| 🔴 HIGH     | {sev[\"HIGH\"]} |\n')
+              f.write(f'| 🟡 MEDIUM   | {sev[\"MEDIUM\"]} |\n| ⚪ LOW      | {sev[\"LOW\"]} |\n')
+              f.write(f'| 📦 **Total** | **{vc}** |\n\n')
+              if crit_high:
+                  f.write('#### 🔴 CRITICAL + HIGH — BLOCK\n')
+                  f.write('| Package | Installed | Vulnerability | Fixed | Severity |\n')
+                  f.write('| :--- | :--- | :--- | :--- | :--- |\n')
+                  for v in crit_high:
+                      f.write(f'| \x60{v.get(\"PkgName\",\"N/A\")}\x60 | {v.get(\"InstalledVersion\",\"N/A\")} | {v.get(\"VulnerabilityID\",\"N/A\")} | {v.get(\"FixedVersion\",\"No Fix\")} | 🔴 {v.get(\"Severity\",\"UNKNOWN\")} |\n')
+                  f.write('\n')
+              if med_low:
+                  f.write(f'<details><summary>🟡 Medium + ⚪ Low ({len(med_low)} findings)</summary>\n\n')
+                  f.write('| Package | Installed | Vulnerability | Fixed | Severity |\n')
+                  f.write('| :--- | :--- | :--- | :--- | :--- |\n')
+                  for v in med_low[:50]:
+                      icon = '🟡' if v.get('Severity')=='MEDIUM' else '⚪'
+                      f.write(f'| \x60{v.get(\"PkgName\",\"N/A\")}\x60 | {v.get(\"InstalledVersion\",\"N/A\")} | {v.get(\"VulnerabilityID\",\"N/A\")} | {v.get(\"FixedVersion\",\"No Fix\")} | {icon} {v.get(\"Severity\",\"UNKNOWN\")} |\n')
+                  f.write('\n</details>\n\n')
+              if vc == 0: f.write('✅ No dependency vulnerabilities found.\n')
+          "
+          echo "sca_critical=$(python3 -c "import json;d=json.load(open('sca_report.json'));all_v=[];[all_v.extend(r.get('Vulnerabilities',[])) for r in d.get('Results',[])];print(sum(1 for v in all_v if v.get('Severity') in ('CRITICAL','HIGH')))")" >> $GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sca-section
+          path: sca_section.md
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sca-report
+          path: sca_report.json
+          retention-days: 30
+
+  # ---------- 4/4: Package Age Check ----------
+  age:
+    runs-on: ubuntu-latest
+    outputs:
+      age_failures: ${{ steps.scan.outputs.age_failures }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Age Check
+        id: scan
+        run: |
+          python3 -c "
+          import json, re, time
+          from datetime import datetime, timezone, timedelta
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          THRESHOLD, NOW = 30, datetime.now(timezone.utc)
+          def check(pkg, ver):
+              for attempt in range(2):
+                  try:
+                      req = Request(f'https://pypi.org/pypi/{pkg}/json', headers={'User-Agent':'CI-Security-Audit/1.0'})
+                      with urlopen(req, timeout=5) as r:
+                          data = json.loads(r.read())
+                          rel = data.get('releases',{}).get(ver,[])
+                          if not rel: return {'pkg':f'{pkg}=={ver}','status':'unknown','age':None}
+                          upload = rel[0].get('upload_time_iso_8601','')
+                          if upload.endswith('Z'): upload = upload[:-1] + '+00:00'
+                          pub = datetime.fromisoformat(upload)
+                          if pub.tzinfo is None: pub = pub.replace(tzinfo=timezone.utc)
+                          age = (NOW - pub).days
+                          return {'pkg':f'{pkg}=={ver}','status':'fail' if age < THRESHOLD else 'pass','age':age}
+                  except HTTPError as e:
+                      if e.code == 429 and attempt < 1: time.sleep(2)
+                      else: return {'pkg':f'{pkg}=={ver}','status':'unknown','age':None}
+                  except: return {'pkg':f'{pkg}=={ver}','status':'unknown','age':None}
+              return {'pkg':f'{pkg}=={ver}','status':'unknown','age':None}
+          packages = []
+          try:
+              with open('requirements.txt') as f:
+                  for line in f:
+                      line = line.split('#')[0].strip()
+                      if not line or line.startswith('-r'): continue
+                      if ';' in line: line = line.split(';')[0].strip()
+                      if '==' in line:
+                          n, v = line.split('==',1)
+                          if '[' in n: n = n.split('[')[0]
+                          packages.append((n.strip(), v.strip()))
+          except FileNotFoundError: pass
+          if not packages:
+              with open('age_section.md','w') as f: f.write('# 📅 4/4 — Package Age Check\n\nℹ️  No pinned packages — skipped.\n')
+              sys.exit(0)
+          results = []
+          with ThreadPoolExecutor(max_workers=16) as ex:
+              futures = {ex.submit(check, n, v): (n, v) for n, v in packages}
+              for fut in as_completed(futures): results.append(fut.result())
+          failures = [r for r in results if r['status']=='fail']
+          unknowns = [r for r in results if r['status']=='unknown']
+          passed   = [r for r in results if r['status']=='pass']
+          with open('age_section.md','w') as f:
+              f.write('# 📅 4/4 — Package Age Check (30-day threshold)\n\n')
+              f.write(f'| Metric                  | Count |\n| :---------------------- | :--- |\n')
+              f.write(f'| 🔴 Failed (< 30 days)   | {len(failures)} |\n')
+              f.write(f'| 🟡 Unknown (unreachable) | {len(unknowns)} |\n')
+              f.write(f'| ✅ Passed (≥ 30 days)   | {len(passed)} |\n')
+              f.write(f'| 📦 Total Checked         | {len(results)} |\n\n')
+              if failures:
+                  f.write('#### 🔴 Age Policy Violations — BLOCK\n')
+                  f.write('| Package | Age (days) | Status |\n| :--- | :--- | :--- |\n')
+                  for r in sorted(failures, key=lambda x: x['age'] or 0):
+                      f.write(f'| \x60{r[\"pkg\"]}\x60 | {r[\"age\"]} | ❌ FAIL |\n')
+                  f.write('\n')
+              if unknowns:
+                  f.write(f'<details><summary>🟡 Unknown — could not verify ({len(unknowns)} packages)</summary>\n\n')
+                  f.write('| Package |\n| :--- |\n')
+                  for r in unknowns: f.write(f'| \x60{r[\"pkg\"]}\x60 |\n')
+                  f.write('\n</details>\n\n')
+              if passed:
+                  f.write(f'<details><summary>✅ Passed — verified ≥ 30 days old ({len(passed)} packages)</summary>\n\n')
+                  f.write('| Package | Age (days) | Status |\n| :--- | :--- | :--- |\n')
+                  for r in sorted(passed, key=lambda x: x['age'] or 0):
+                      f.write(f'| \x60{r[\"pkg\"]}\x60 | {r[\"age\"]} | ✅ PASS |\n')
+                  f.write('\n</details>\n\n')
+              if not failures and not unknowns: f.write('✅ All packages pass the 30-day age threshold.\n')
+          with open('/tmp/age_results.json','w') as f:
+              json.dump({'failures': len(failures)}, f)
+          " 2>&1
+          echo "age_failures=$(python3 -c "import json;print(json.load(open('/tmp/age_results.json'))['failures'])")" >> $GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v7
+        with:
+          name: age-section
+          path: age_section.md
+          retention-days: 30
+
+# ===========================================================================
+# GATE — collects parallel results, renders dashboard, sets outputs
+# ===========================================================================
+
+  gate:
+    needs: [depx, sast, sca, age]
+    runs-on: ubuntu-latest
+    outputs:
+      has_failures: ${{ steps.gate.outputs.has_failures }}
+      failure_count: ${{ steps.gate.outputs.failure_count }}
+    steps:
+      - uses: actions/download-artifact@v8
+
+      - name: Render Dashboard + Gate
+        id: gate
+        run: |
+          echo "# 🛡️ Pre-CI Security Audit Dashboard" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Config | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Trigger** | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Scanners** | depx (Malware) → Semgrep (SAST) → Trivy (SCA) → Age Check |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Concatenate sections from parallel jobs
+          for section in depx-section/depx_section.md sast-section/sast_section.md sca-section/sca_section.md age-section/age_section.md; do
+            if [ -f "$section" ]; then
+              cat "$section" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          # Gate logic
+          DEPX_RECENT=${{ needs.depx.outputs.depx_recent || 0 }}
+          SAST_ERRORS=${{ needs.sast.outputs.sast_errors || 0 }}
+          SCA_CRITICAL=${{ needs.sca.outputs.sca_critical || 0 }}
+          AGE_FAILURES=${{ needs.age.outputs.age_failures || 0 }}
+
+          OVERALL=0
+          REASONS=""
+          if [ "$DEPX_RECENT" -gt 0 ]; then OVERALL=$((OVERALL + DEPX_RECENT)); REASONS="${REASONS}\n- depx: ${DEPX_RECENT} recent malicious package(s)"; fi
+          if [ "$SAST_ERRORS" -gt 0 ]; then OVERALL=$((OVERALL + SAST_ERRORS)); REASONS="${REASONS}\n- SAST: ${SAST_ERRORS} error-severity finding(s)"; fi
+          if [ "$SCA_CRITICAL" -gt 0 ]; then OVERALL=$((OVERALL + SCA_CRITICAL)); REASONS="${REASONS}\n- SCA: ${SCA_CRITICAL} CRITICAL vulnerability(s)"; fi
+          if [ "$AGE_FAILURES" -gt 0 ]; then OVERALL=$((OVERALL + AGE_FAILURES)); REASONS="${REASONS}\n- Age: ${AGE_FAILURES} package(s) newer than 30 days"; fi
+
+          FORCE_DEPLOY="${{ github.event_name == 'workflow_call' && inputs.force_deploy || 'false' }}"
+          if [ "$FORCE_DEPLOY" == "true" ] && [ "$AGE_FAILURES" -gt 0 ]; then
+            echo "⚠️ **Age check bypassed via force_deploy flag.** ${AGE_FAILURES} package(s) would have been blocked." >> $GITHUB_STEP_SUMMARY
+            OVERALL=$((OVERALL - AGE_FAILURES))
+          fi
+
+          echo "has_failures=$([ $OVERALL -gt 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "failure_count=${OVERALL}" >> $GITHUB_OUTPUT
+
+          if [ $OVERALL -gt 0 ]; then
+            echo "### 🚨 Gate Result: BLOCKED (${OVERALL} failure(s))" >> $GITHUB_STEP_SUMMARY
+            echo -e "**Failure details:**${REASONS}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ✅ Gate Result: PASSED" >> $GITHUB_STEP_SUMMARY
+          fi
